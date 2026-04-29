@@ -1,6 +1,10 @@
 """
 model.py — CyberFury AI Forensic Lab
 Handles model loading, image validation, prediction, and explainability.
+
+ENSEMBLE v2: Replaced naive weighted-average with a four-path decision engine
+that detects strong disagreement, applies dynamic trust weighting, and returns
+an UNCERTAIN verdict when models conflict irreconcilably.
 """
 
 import torch
@@ -10,37 +14,37 @@ from PIL import Image
 import numpy as np
 
 # ─── Model Registry ───────────────────────────────────────────────────────────
-# Primary model — lightweight SDXL-tuned binary classifier
-PRIMARY_MODEL_ID = "Organika/sdxl-detector"
-
-# Secondary model for ensemble detection (if unavailable, falls back to primary)
+PRIMARY_MODEL_ID   = "Organika/sdxl-detector"
 SECONDARY_MODEL_ID = "umm-maybe/AI-image-detector"
 
-# ─── Ensemble Configuration ────────────────────────────────────────────────────
-# Weights for weighted averaging of ensemble predictions
-PRIMARY_MODEL_WEIGHT = 0.6
+# ─── Ensemble Configuration ───────────────────────────────────────────────────
+# Base weights (may be overridden dynamically by the decision engine)
+PRIMARY_MODEL_WEIGHT   = 0.6
 SECONDARY_MODEL_WEIGHT = 0.4
 
-# ─── Constraints ──────────────────────────────────────────────────────────────
-MAX_PIXELS     = 4096       # max dimension (px)
-MIN_PIXELS     = 32         # min dimension (px)
-MAX_FILE_MB    = 15         # hard limit for file size
+# Decision thresholds
+_STRONG_AGREE_AI_THRESHOLD    = 70.0   # both models ≥ this  → strong DEEPFAKE
+_STRONG_AGREE_REAL_THRESHOLD  = 30.0   # both models ≤ this  → strong AUTHENTIC
+_DISAGREEMENT_THRESHOLD       = 40.0   # score gap ≥ this    → UNCERTAIN
+_HIGH_CONFIDENCE_THRESHOLD    = 90.0   # single-model conf   → boost that model's weight
 
-# Keywords used to locate the "AI / fake" label in id2label dict
+# ─── Constraints ──────────────────────────────────────────────────────────────
+MAX_PIXELS  = 4096
+MIN_PIXELS  = 32
+MAX_FILE_MB = 15
+
 _AI_KEYWORDS   = {"artificial", "fake", "ai", "sdxl", "generated", "synthetic"}
 _REAL_KEYWORDS = {"real", "authentic", "natural", "human", "genuine", "photo"}
 
 
-# ─── Validation ───────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Validation
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def validate_image(image: Image.Image) -> tuple[bool, str]:
-    """
-    Validate that the image is processable.
-    Returns (ok: bool, message: str).
-    """
+    """Validate that the image is processable. Returns (ok, message)."""
     if image.mode not in ("RGB", "RGBA", "L", "P", "CMYK", "YCbCr"):
         return False, f"Unsupported colour mode: {image.mode}"
-
     w, h = image.size
     if w > MAX_PIXELS or h > MAX_PIXELS:
         return False, (
@@ -55,14 +59,13 @@ def validate_image(image: Image.Image) -> tuple[bool, str]:
     return True, "OK"
 
 
-# ─── Model Loading ────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Model Loading  (unchanged — cached per Streamlit session)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_resource(show_spinner=False)
 def load_primary_model():
-    """
-    Load and cache the primary detection model.
-    Called once per Streamlit session; subsequent calls return from cache.
-    """
+    """Load and cache the primary detection model."""
     try:
         processor = AutoImageProcessor.from_pretrained(PRIMARY_MODEL_ID, use_fast=True)
         model     = AutoModelForImageClassification.from_pretrained(PRIMARY_MODEL_ID)
@@ -75,10 +78,7 @@ def load_primary_model():
 
 @st.cache_resource(show_spinner=False)
 def load_secondary_model():
-    """
-    Load and cache the secondary detection model for ensemble inference.
-    Returns None if secondary model load fails (graceful degradation).
-    """
+    """Load and cache the secondary model. Returns None on failure (graceful degradation)."""
     try:
         processor = AutoImageProcessor.from_pretrained(SECONDARY_MODEL_ID, use_fast=True)
         model     = AutoModelForImageClassification.from_pretrained(SECONDARY_MODEL_ID)
@@ -86,68 +86,55 @@ def load_secondary_model():
         model.to(device).eval()
         return processor, model, device
     except Exception:
-        # Graceful fallback: return None if secondary model unavailable
         return None
 
 
-# ─── Prediction ───────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Per-model Inference  (unchanged)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _resolve_ai_label(id2label: dict) -> tuple[int | None, int | None]:
     """
-    Scan id2label to find which index corresponds to AI-generated content
-    and which to authentic content.  Returns (ai_idx, real_idx).
-    Falls back to (0, 1) if detection is ambiguous.
+    Scan id2label to find AI-generated and authentic label indices.
+    Returns (ai_idx, real_idx). Falls back to (0, 1) if ambiguous.
     """
-    ai_idx   = None
-    real_idx = None
-
+    ai_idx = real_idx = None
     for idx, label in id2label.items():
         lwr = label.lower()
         if any(k in lwr for k in _AI_KEYWORDS):
             ai_idx = idx
         elif any(k in lwr for k in _REAL_KEYWORDS):
             real_idx = idx
-
-    # Fallback: assume index 0 = AI, 1 = real (common convention)
-    if ai_idx is None:
-        ai_idx = 0
-    if real_idx is None:
-        real_idx = 1 if len(id2label) > 1 else 0
-
+    if ai_idx   is None: ai_idx   = 0
+    if real_idx is None: real_idx = 1 if len(id2label) > 1 else 0
     return ai_idx, real_idx
 
 
 def _run_inference(image: Image.Image, processor, model, device) -> dict:
     """
-    Core inference routine.
-    Returns a dict with all raw probability information.
+    Core inference for a single model.
+    Returns a dict with ai_score, real_score, confidence, predicted_label, etc.
     """
-    # Ensure RGB — necessary for most vision transformers
     if image.mode != "RGB":
         image = image.convert("RGB")
 
     inputs = processor(images=image, return_tensors="pt").to(device)
-
     with torch.no_grad():
         logits = model(**inputs).logits
         probs  = torch.nn.functional.softmax(logits, dim=-1)[0].cpu().tolist()
 
-    id2label   = model.config.id2label                       # e.g. {0: "artificial", 1: "real"}
-    ai_idx, real_idx = _resolve_ai_label(id2label)
-
-    # Build a clean scores dict keyed by human-readable label
-    scores = {id2label[i]: round(probs[i] * 100, 3) for i in range(len(probs))}
-
-    ai_score   = probs[ai_idx]   * 100
-    real_score = probs[real_idx] * 100
-
-    predicted_idx   = int(np.argmax(probs))
-    predicted_label = id2label[predicted_idx]
+    id2label            = model.config.id2label
+    ai_idx, real_idx    = _resolve_ai_label(id2label)
+    scores              = {id2label[i]: round(probs[i] * 100, 3) for i in range(len(probs))}
+    ai_score            = probs[ai_idx]   * 100
+    real_score          = probs[real_idx] * 100
+    predicted_idx       = int(np.argmax(probs))
+    predicted_label     = id2label[predicted_idx]
 
     return {
         "predicted_label": predicted_label,
-        "ai_score":        round(ai_score,   2),   # % probability of being AI-generated
-        "real_score":      round(real_score, 2),   # % probability of being authentic
+        "ai_score":        round(ai_score,   2),
+        "real_score":      round(real_score, 2),
         "confidence":      round(probs[predicted_idx] * 100, 2),
         "all_scores":      scores,
         "is_fake":         ai_score > 50.0,
@@ -155,109 +142,392 @@ def _run_inference(image: Image.Image, processor, model, device) -> dict:
     }
 
 
-def _run_ensemble_inference(image: Image.Image) -> dict:
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Ensemble Decision Engine  ← REPLACED / REDESIGNED
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _compute_dynamic_weights(p_ai: float, s_ai: float) -> tuple[float, float]:
     """
-    Run ensemble inference using both primary and secondary models.
-    Performs weighted averaging and agreement detection.
-    Returns a structured result dict with individual model outputs and ensemble verdict.
+    Compute trust weights dynamically based on each model's confidence.
+
+    Rules
+    -----
+    • If primary is very confident (≥ 90 % on either side)   → boost to 0.80 / 0.20
+    • If secondary is very confident and primary is not       → boost secondary to 0.30 / 0.70
+    • Otherwise keep the configured base weights.
+
+    Both weights always sum to 1.0.
     """
-    # Load models (cached)
-    primary_processor, primary_model, primary_device = load_primary_model()
-    
-    secondary_data = load_secondary_model()
-    has_secondary = secondary_data is not None
-    
-    # Run primary inference
-    primary_result = _run_inference(image, primary_processor, primary_model, primary_device)
-    
-    models_data = [
-        {
-            "name": "Primary (Organika/sdxl-detector)",
-            "ai_score": primary_result["ai_score"],
-            "real_score": primary_result["real_score"],
-            "label": primary_result["predicted_label"],
-        }
-    ]
-    
-    # Run secondary inference if available
-    if has_secondary:
-        secondary_processor, secondary_model, secondary_device = secondary_data
-        secondary_result = _run_inference(image, secondary_processor, secondary_model, secondary_device)
-        
-        models_data.append({
-            "name": "Secondary (umm-maybe/AI-image-detector)",
-            "ai_score": secondary_result["ai_score"],
-            "real_score": secondary_result["real_score"],
-            "label": secondary_result["predicted_label"],
-        })
-        
-        # Weighted average of AI scores
-        ensemble_ai_score = (
-            (primary_result["ai_score"] * PRIMARY_MODEL_WEIGHT) +
-            (secondary_result["ai_score"] * SECONDARY_MODEL_WEIGHT)
+    p_conf = max(p_ai, 100 - p_ai)   # distance from 50 → how confident is this model
+    s_conf = max(s_ai, 100 - s_ai)
+
+    if p_conf >= _HIGH_CONFIDENCE_THRESHOLD:
+        return 0.80, 0.20
+    if s_conf >= _HIGH_CONFIDENCE_THRESHOLD and p_conf < 70:
+        return 0.30, 0.70
+    return PRIMARY_MODEL_WEIGHT, SECONDARY_MODEL_WEIGHT
+
+
+def _classify_agreement(p_ai: float, s_ai: float) -> tuple[str, float]:
+    """
+    Classify the relationship between the two model scores.
+
+    Returns
+    -------
+    (case_label, difference)
+
+    case_label:
+      "STRONG_AI"        — both firmly predict AI
+      "STRONG_REAL"      — both firmly predict real
+      "MODERATE"         — same direction but not extreme
+      "WEAK_AGREEMENT"   — same >50 / <50 side but gap is notable
+      "STRONG_DISAGREE"  — different sides, large gap
+    """
+    diff = abs(p_ai - s_ai)
+    p_fake = p_ai >= 50.0
+    s_fake = s_ai >= 50.0
+
+    if p_ai >= _STRONG_AGREE_AI_THRESHOLD and s_ai >= _STRONG_AGREE_AI_THRESHOLD:
+        return "STRONG_AI", diff
+
+    if p_ai <= _STRONG_AGREE_REAL_THRESHOLD and s_ai <= _STRONG_AGREE_REAL_THRESHOLD:
+        return "STRONG_REAL", diff
+
+    if p_fake != s_fake and diff >= _DISAGREEMENT_THRESHOLD:
+        return "STRONG_DISAGREE", diff
+
+    if p_fake == s_fake:
+        return "MODERATE", diff
+
+    return "WEAK_AGREEMENT", diff
+
+
+def _build_ensemble_verdict(
+    p_result: dict,
+    s_result: dict,
+) -> dict:
+    """
+    Four-path decision engine.  Replaces the old single weighted-average.
+
+    Path A — Strong AI agreement    → DEEPFAKE   HIGH
+    Path B — Strong Real agreement  → AUTHENTIC  HIGH
+    Path C — Moderate agreement     → weighted average, MEDIUM
+    Path D — Strong disagreement    → UNCERTAIN  LOW  (score NOT averaged blindly)
+
+    Returns a structured verdict dict consumed by _run_ensemble_inference().
+    """
+    p_ai = p_result["ai_score"]
+    s_ai = s_result["ai_score"]
+
+    case, diff = _classify_agreement(p_ai, s_ai)
+    pw, sw     = _compute_dynamic_weights(p_ai, s_ai)
+
+    # ── Path A: Both strongly say AI ──────────────────────────────────────────
+    if case == "STRONG_AI":
+        final_ai  = (p_ai * pw) + (s_ai * sw)          # weighted average (both high)
+        conf_raw  = (p_result["confidence"] * pw) + (s_result["confidence"] * sw)
+        return _verdict_dict(
+            verdict        = "DEEPFAKE",
+            final_ai       = final_ai,
+            confidence_lvl = "HIGH",
+            agreement      = True,
+            diff           = diff,
+            note           = "Both models strongly indicate AI-generated content.",
+            weights_used   = (pw, sw),
         )
-        
-        # Agreement detection: check if both models agree on verdict
-        primary_is_fake = primary_result["is_fake"]
-        secondary_is_fake = secondary_result["is_fake"]
-        models_agree = primary_is_fake == secondary_is_fake
+
+    # ── Path B: Both strongly say Real ───────────────────────────────────────
+    if case == "STRONG_REAL":
+        final_ai = (p_ai * pw) + (s_ai * sw)
+        return _verdict_dict(
+            verdict        = "AUTHENTIC",
+            final_ai       = final_ai,
+            confidence_lvl = "HIGH",
+            agreement      = True,
+            diff           = diff,
+            note           = "Both models strongly indicate an authentic image.",
+            weights_used   = (pw, sw),
+        )
+
+    # ── Path C: Moderate agreement (same side, gap < threshold) ──────────────
+    if case in ("MODERATE", "WEAK_AGREEMENT"):
+        final_ai = (p_ai * pw) + (s_ai * sw)
+        verdict  = "DEEPFAKE" if final_ai >= 50.0 else "AUTHENTIC"
+        # Confidence degrades as the gap grows
+        conf_penalty = min(diff / _DISAGREEMENT_THRESHOLD, 1.0) * 15   # up to -15 pts
+        conf_lvl = "MEDIUM"
+        note = (
+            "Models lean the same direction but differ in magnitude. "
+            f"Score gap: {diff:.1f} pts — weighted average applied."
+        )
+        return _verdict_dict(
+            verdict        = verdict,
+            final_ai       = final_ai,
+            confidence_lvl = conf_lvl,
+            agreement      = True,
+            diff           = diff,
+            note           = note,
+            weights_used   = (pw, sw),
+        )
+
+    # ── Path D: Strong disagreement — UNCERTAIN ───────────────────────────────
+    # Do NOT blindly average.  Instead anchor to the more-confident model
+    # but cap the final score at 65 % on either side to reflect uncertainty.
+    p_conf = max(p_ai, 100 - p_ai)
+    s_conf = max(s_ai, 100 - s_ai)
+
+    if p_conf >= s_conf:
+        anchor_ai   = p_ai
+        anchor_note = "Primary model (higher confidence) used as anchor."
     else:
-        # Fallback: only primary model available
-        ensemble_ai_score = primary_result["ai_score"]
-        models_agree = True  # Trivially true with one model
-    
-    # Determine final verdict based on weighted ensemble score
-    ensemble_is_fake = ensemble_ai_score > 50.0
-    ensemble_verdict = "DEEPFAKE" if ensemble_is_fake else "AUTHENTIC"
-    
+        anchor_ai   = s_ai
+        anchor_note = "Secondary model (higher confidence) used as anchor."
+
+    # Shrink the score toward 50 to represent genuine uncertainty
+    uncertainty_pull = 0.40   # pull 40 % of the way back to 50
+    final_ai = anchor_ai + (50.0 - anchor_ai) * uncertainty_pull
+    final_ai = round(min(max(final_ai, 0.0), 100.0), 2)
+
+    note = (
+        f"Models strongly disagree (gap: {diff:.1f} pts). "
+        f"Result may be unreliable — post-processing or edge-case image suspected. "
+        f"{anchor_note}"
+    )
+
+    return _verdict_dict(
+        verdict        = "UNCERTAIN",
+        final_ai       = final_ai,
+        confidence_lvl = "LOW",
+        agreement      = False,
+        diff           = diff,
+        note           = note,
+        weights_used   = (pw, sw),
+    )
+
+
+def _verdict_dict(
+    verdict: str,
+    final_ai: float,
+    confidence_lvl: str,
+    agreement: bool,
+    diff: float,
+    note: str,
+    weights_used: tuple[float, float],
+) -> dict:
+    """Construct the canonical ensemble verdict dictionary."""
+    final_ai = round(final_ai, 2)
     return {
-        "final_verdict": ensemble_verdict,
-        "final_ai_score": round(ensemble_ai_score, 2),
-        "ensemble_real_score": round(100 - ensemble_ai_score, 2),
-        "confidence": round(abs(ensemble_ai_score - 50.0) + 50.0, 2),  # Higher when far from 50%
-        "agreement": models_agree,
-        "has_secondary": has_secondary,
-        "models": models_data,
-        # Legacy fields for backward compatibility
-        "predicted_label": "ensemble",
-        "ai_score": round(ensemble_ai_score, 2),
-        "real_score": round(100 - ensemble_ai_score, 2),
-        "is_fake": ensemble_is_fake,
-        "all_scores": {"AI": round(ensemble_ai_score, 2), "Real": round(100 - ensemble_ai_score, 2)},
+        "final_verdict":    verdict,
+        "final_ai_score":   final_ai,
+        "final_real_score": round(100 - final_ai, 2),
+        "confidence_level": confidence_lvl,   # "HIGH" / "MEDIUM" / "LOW"
+        "agreement":        agreement,
+        "difference":       round(diff, 2),
+        "note":             note,
+        "weights_used":     weights_used,
     }
 
 
-def get_confidence_tier(score: float) -> tuple[str, str]:
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Ensemble Orchestration  (replaces old _run_ensemble_inference)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _run_ensemble_inference(image: Image.Image) -> dict:
     """
-    Map a [0,100] AI score to a human tier and theme colour.
+    Load both models (cached), run per-model inference, apply the decision
+    engine, and return a fully-populated result dict.
+    """
+    primary_processor, primary_model, primary_device = load_primary_model()
+    secondary_data = load_secondary_model()
+    has_secondary  = secondary_data is not None
+
+    primary_result = _run_inference(image, primary_processor, primary_model, primary_device)
+
+    models_data = [
+        {
+            "name":       "Primary (Organika/sdxl-detector)",
+            "ai_score":   primary_result["ai_score"],
+            "real_score": primary_result["real_score"],
+            "label":      primary_result["predicted_label"],
+            "confidence": primary_result["confidence"],
+        }
+    ]
+
+    # ── Single-model fallback ─────────────────────────────────────────────────
+    if not has_secondary:
+        p_ai = primary_result["ai_score"]
+        verdict  = "DEEPFAKE" if p_ai >= 50.0 else "AUTHENTIC"
+        conf_lvl = (
+            "HIGH"   if max(p_ai, 100 - p_ai) >= _HIGH_CONFIDENCE_THRESHOLD else
+            "MEDIUM" if max(p_ai, 100 - p_ai) >= 60 else
+            "LOW"
+        )
+        return _assemble_output(
+            verdict_block  = _verdict_dict(
+                verdict        = verdict,
+                final_ai       = p_ai,
+                confidence_lvl = conf_lvl,
+                agreement      = True,
+                diff           = 0.0,
+                note           = "Secondary model unavailable — primary model only.",
+                weights_used   = (1.0, 0.0),
+            ),
+            primary_result = primary_result,
+            models_data    = models_data,
+            has_secondary  = False,
+        )
+
+    # ── Two-model path ────────────────────────────────────────────────────────
+    secondary_processor, secondary_model, secondary_device = secondary_data
+    secondary_result = _run_inference(
+        image, secondary_processor, secondary_model, secondary_device
+    )
+
+    models_data.append({
+        "name":       "Secondary (umm-maybe/AI-image-detector)",
+        "ai_score":   secondary_result["ai_score"],
+        "real_score": secondary_result["real_score"],
+        "label":      secondary_result["predicted_label"],
+        "confidence": secondary_result["confidence"],
+    })
+
+    verdict_block = _build_ensemble_verdict(primary_result, secondary_result)
+
+    return _assemble_output(
+        verdict_block  = verdict_block,
+        primary_result = primary_result,
+        models_data    = models_data,
+        has_secondary  = True,
+        secondary_result = secondary_result,
+    )
+
+
+def _assemble_output(
+    verdict_block:    dict,
+    primary_result:   dict,
+    models_data:      list,
+    has_secondary:    bool,
+    secondary_result: dict | None = None,
+) -> dict:
+    """
+    Merge the verdict block with raw inference data and legacy-compatible fields
+    so that no downstream consumer (app.py, ui.py, report_generator.py) breaks.
+    """
+    final_ai   = verdict_block["final_ai_score"]
+    verdict    = verdict_block["final_verdict"]
+    is_fake    = verdict == "DEEPFAKE"
+    conf_level = verdict_block["confidence_level"]
+
+    # Map the three-tier confidence level to a legacy numeric confidence value
+    # that report_generator.py uses (it expects a float in [50, 100])
+    _conf_numeric_map = {"HIGH": 92.0, "MEDIUM": 72.0, "LOW": 52.0}
+    conf_numeric = _conf_numeric_map.get(conf_level, 72.0)
+
+    return {
+        # ── New structured fields ──────────────────────────────────────────
+        "final_verdict":    verdict,
+        "final_ai_score":   final_ai,
+        "final_real_score": verdict_block["final_real_score"],
+        "confidence_level": conf_level,
+        "agreement":        verdict_block["agreement"],
+        "difference":       verdict_block["difference"],
+        "note":             verdict_block["note"],
+        "weights_used":     verdict_block["weights_used"],
+        "has_secondary":    has_secondary,
+        "models":           models_data,
+
+        # ── Legacy fields (backward-compatible) ───────────────────────────
+        "predicted_label":  "ensemble",
+        "ai_score":         final_ai,
+        "real_score":       verdict_block["final_real_score"],
+        "confidence":       conf_numeric,
+        "is_fake":          is_fake,
+        "all_scores": {
+            "AI":   final_ai,
+            "Real": verdict_block["final_real_score"],
+        },
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Confidence Tier  (updated to honour new LOW / MEDIUM / HIGH from engine)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_confidence_tier(score: float, confidence_level: str = "") -> tuple[str, str]:
+    """
+    Map ensemble output to a human-readable tier and theme colour.
+
+    If confidence_level is supplied (new field), it takes precedence.
+    Falls back to score-based heuristic for backward compatibility.
+
     Returns (tier_label, hex_colour).
     """
+    if confidence_level == "HIGH":
+        return "High Confidence",   "#EB5757"
+    if confidence_level == "MEDIUM":
+        return "Medium Confidence", "#F2994A"
+    if confidence_level == "LOW":
+        return "Uncertain",         "#A78BFA"   # purple for uncertain
+
+    # Legacy score-based fallback
     if score >= 90:
         return "High Confidence",   "#EB5757"
-    elif score >= 60:
+    if score >= 60:
         return "Medium Confidence", "#F2994A"
-    else:
-        return "Uncertain",         "#F2C94C"
+    return "Uncertain",             "#F2C94C"
 
 
-# ─── Explainability ───────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Explainability  (extended to cover UNCERTAIN verdict)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_explanation(result: dict) -> list[dict]:
     """
-    Generate a list of explanation items (icon, heading, body) for the UI.
-    These are heuristic, model-agnostic interpretations.
+    Generate explanation items for the UI.
+    Now handles UNCERTAIN verdict and surfaces the ensemble note.
     """
-    score  = result["ai_score"]
+    score   = result["ai_score"]
     is_fake = result["is_fake"]
-    tier, _ = get_confidence_tier(score)
-    items  = []
+    verdict = result.get("final_verdict", "")
+    note    = result.get("note", "")
+    items   = []
 
+    # ── UNCERTAIN path ────────────────────────────────────────────────────────
+    if verdict == "UNCERTAIN":
+        items.append({
+            "icon": "⚠️",
+            "heading": "Conflicting Model Signals",
+            "body": (
+                f"The two detection models produced significantly different results "
+                f"(gap: {result.get('difference', 0):.1f} pts). "
+                "This typically occurs with post-processed, composited, or heavily "
+                "compressed images that partially erase AI generation fingerprints."
+            ),
+        })
+        items.append({
+            "icon": "🔍",
+            "heading": "Recommendation",
+            "body": (
+                "Do not rely on this result alone. Cross-check with EXIF metadata, "
+                "reverse-image search, and manual visual inspection of texture and "
+                "lighting consistency."
+            ),
+        })
+        if note:
+            items.append({
+                "icon": "📋",
+                "heading": "Engine Decision Note",
+                "body": note,
+            })
+        return items
+
+    # ── DEEPFAKE path ─────────────────────────────────────────────────────────
     if is_fake:
         items.append({
             "icon": "🔬",
             "heading": "Synthetic Pixel Distribution",
             "body": (
-                f"The model assigned {score:.1f}% probability to AI generation. "
+                f"The ensemble assigned {score:.1f}% probability to AI generation. "
                 "GAN- and diffusion-based images leave characteristic frequency-domain "
                 "artefacts that differ from real camera noise."
             ),
@@ -293,17 +563,19 @@ def _build_explanation(result: dict) -> list[dict]:
                 "icon": "❓",
                 "heading": "Inconclusive Signal",
                 "body": (
-                    "The model is not confident enough to make a reliable call. "
-                    "Consider corroborating with metadata analysis and reverse image search."
+                    "The ensemble score narrowly favours AI, but confidence is low. "
+                    "Corroborate with metadata analysis and reverse image search."
                 ),
             })
+
+    # ── AUTHENTIC path ────────────────────────────────────────────────────────
     else:
         real = result["real_score"]
         items.append({
             "icon": "📷",
             "heading": "Natural Camera Noise Profile",
             "body": (
-                f"The model assigned {real:.1f}% probability to authentic capture. "
+                f"The ensemble assigned {real:.1f}% probability to authentic capture. "
                 "Camera sensor noise and natural optical aberrations match expected patterns."
             ),
         })
@@ -335,10 +607,20 @@ def _build_explanation(result: dict) -> list[dict]:
                 ),
             })
 
+    # Append engine note as a closing item when present
+    if note and verdict != "UNCERTAIN":
+        items.append({
+            "icon": "📋",
+            "heading": "Ensemble Decision Note",
+            "body": note,
+        })
+
     return items
 
 
-# ─── Public API ───────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Public API  (interface unchanged)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def analyze_image(image: Image.Image) -> dict:
     """
@@ -346,21 +628,31 @@ def analyze_image(image: Image.Image) -> dict:
     Always returns a dict; on failure the dict contains an 'error' key.
     """
     try:
-        # 1. Validate
         ok, msg = validate_image(image)
         if not ok:
             return {"error": msg}
 
-        # 2. Run ensemble inference (loads both models, cached after first call)
         ensemble_result = _run_ensemble_inference(image)
 
-        # 3. Enrich with UI metadata
-        tier, colour             = get_confidence_tier(ensemble_result["ai_score"])
-        ensemble_result["conf_label"]     = tier
-        ensemble_result["conf_colour"]    = colour
-        ensemble_result["verdict"]        = ensemble_result["final_verdict"]
-        ensemble_result["verdict_colour"] = "#EB5757" if ensemble_result["is_fake"] else "#27AE60"
-        ensemble_result["explanation"]    = _build_explanation(ensemble_result)
+        # Enrich with UI metadata
+        conf_level = ensemble_result.get("confidence_level", "")
+        tier, colour = get_confidence_tier(ensemble_result["ai_score"], conf_level)
+
+        ensemble_result["conf_label"]  = tier
+        ensemble_result["conf_colour"] = colour
+        ensemble_result["verdict"]     = ensemble_result["final_verdict"]
+
+        # Colour mapping: UNCERTAIN gets a purple/amber treatment
+        _verdict_colours = {
+            "DEEPFAKE":  "#EF4444",
+            "AUTHENTIC": "#10B981",
+            "UNCERTAIN": "#F59E0B",
+        }
+        ensemble_result["verdict_colour"] = _verdict_colours.get(
+            ensemble_result["final_verdict"], "#F59E0B"
+        )
+
+        ensemble_result["explanation"] = _build_explanation(ensemble_result)
 
         return ensemble_result
 

@@ -4,8 +4,10 @@ All visual components: theme injection, progress stages, verdict card,
 explainability panel, metadata viewer, and forensic tools bar.
 
 REDESIGNED: Premium SaaS dashboard aesthetic — clean hierarchy, modular card system,
-smooth gradients, polished typography (Syne + Space Grotesk abandoned for
-Rajdhani + DM Mono + DM Sans for a sharp forensic-tech feel).
+smooth gradients, polished typography (Rajdhani + DM Mono + DM Sans).
+
+UI v2: Handles new UNCERTAIN verdict state, disagreement warning banner,
+confidence-level badges (HIGH / MEDIUM / LOW), and per-model confidence display.
 """
 
 import streamlit as st
@@ -40,7 +42,8 @@ T = {
     "success_dim":  "#064E3B",
     "warning":      "#F59E0B",
     "warning_dim":  "#78350F",
-    "uncertain":    "#A78BFA",
+    "uncertain":    "#A78BFA",   # purple — used for UNCERTAIN verdict
+    "uncertain_bg": "#1E1535",  # dark purple surface for uncertain cards
 
     # Typography
     "text":         "#F0F6FF",
@@ -361,8 +364,14 @@ def run_with_progress(image, scan_fn, meta_fn):
 
 def render_verdict_card(result: dict) -> None:
     """
-    Hero verdict card — center-aligned, large verdict text, confidence badge,
-    smooth gradient progress bar, clean spacing.
+    Hero verdict card — handles DEEPFAKE / AUTHENTIC / UNCERTAIN verdicts.
+
+    v2 changes
+    ----------
+    • Reads confidence_level (HIGH / MEDIUM / LOW) from the ensemble engine
+    • Renders a distinct UNCERTAIN state with warning styling and score gap display
+    • Shows HIGH/MEDIUM/LOW badge instead of raw score tier label
+    • High-risk banner only for HIGH-confidence DEEPFAKE results
     """
     score   = result["ai_score"]
     real    = result["real_score"]
@@ -370,38 +379,76 @@ def render_verdict_card(result: dict) -> None:
     verdict = result["verdict"]
     tier    = result["conf_label"]
 
-    # Pick a contextual icon
-    verdict_icon = "⚠️" if result.get("is_fake") else "✅"
+    conf_level = result.get("confidence_level", "")
+    is_uncertain = verdict == "UNCERTAIN"
 
-    # Inner HTML for the hero card
+    # ── Contextual icon ───────────────────────────────────────────────────────
+    _icons = {"DEEPFAKE": "⚠️", "AUTHENTIC": "✅", "UNCERTAIN": "❓"}
+    verdict_icon = _icons.get(verdict, "🔍")
+
+    # ── Confidence level badge (HIGH / MEDIUM / LOW) ──────────────────────────
+    _conf_colours = {
+        "HIGH":   T["danger"]   if verdict == "DEEPFAKE" else T["success"],
+        "MEDIUM": T["warning"],
+        "LOW":    T["uncertain"],
+    }
+    conf_badge_colour = _conf_colours.get(conf_level, T["warning"])
+    conf_badge_text   = conf_level if conf_level else tier
+
+    # ── Sub-label below verdict name ──────────────────────────────────────────
+    _sublabels = {
+        "DEEPFAKE":  "AI-generated content detected",
+        "AUTHENTIC": "Authentic image — no AI signatures found",
+        "UNCERTAIN": "Models disagree — result may be unreliable",
+    }
+    sublabel = _sublabels.get(verdict, "Ensemble detection result")
+
+    # ── Score gap (shown on UNCERTAIN) ───────────────────────────────────────
+    diff = result.get("difference", 0.0)
+    diff_row = ""
+    if is_uncertain and diff > 0:
+        diff_row = f"""
+        <div style="display:inline-flex;align-items:center;gap:8px;
+                    background:{T['warning']}18;border:1px solid {T['warning']}33;
+                    border-radius:8px;padding:5px 12px;margin-top:10px;">
+            <span style="color:{T['warning']};font-size:0.78rem;font-weight:700;">
+                Score Gap
+            </span>
+            <span class="cf-mono" style="color:{T['warning']};">{diff:.1f} pts</span>
+        </div>"""
+
+    # ── Progress bar track colour ─────────────────────────────────────────────
+    bar_track = T["uncertain_bg"] if is_uncertain else T["surface2"]
+
     inner = f"""
-    <!-- Top meta row: label + confidence badge -->
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;">
+    <!-- Header row: label + confidence badge -->
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
         {_label('Analysis Verdict')}
-        {_badge(tier, colour, "0.70rem")}
+        {_badge(conf_badge_text, conf_badge_colour, "0.70rem")}
     </div>
 
-    <!-- Large verdict text -->
-    <div style="text-align:center;padding:10px 0 18px;">
-        <div style="font-size:3.4rem;margin-bottom:4px;">{verdict_icon}</div>
+    <!-- Large verdict text block -->
+    <div style="text-align:center;padding:8px 0 16px;">
+        <div style="font-size:3rem;margin-bottom:4px;">{verdict_icon}</div>
         <h2 style="
             color:{colour} !important;
             font-family:'Rajdhani',sans-serif !important;
-            font-size:2.6rem;
+            font-size:2.5rem;
             font-weight:700;
             letter-spacing:.12em;
             margin:0;
-            text-shadow:0 0 32px {colour}55;
+            text-shadow:0 0 40px {colour}44;
         ">{verdict}</h2>
-        <p style="color:{T['text2']};font-size:0.82rem;margin:6px 0 0;letter-spacing:.06em;">
-            Ensemble weighted detection result
+        <p style="color:{T['text2']};font-size:0.82rem;margin:5px 0 0;letter-spacing:.04em;">
+            {sublabel}
         </p>
+        {diff_row}
     </div>
 
     <!-- Probability meter -->
-    {_label('Synthetic Probability', 'margin-top:6px;')}
-    {_progress_bar(score, colour, '12px', T['surface2'])}
-    <div style="display:flex;justify-content:space-between;margin-top:4px;">
+    {_label('Synthetic Probability', 'margin-top:8px;')}
+    {_progress_bar(score, colour, '12px', bar_track)}
+    <div style="display:flex;justify-content:space-between;margin-top:5px;">
         <span class="cf-mono" style="color:{colour};">AI &nbsp;{score:.1f}%</span>
         <span class="cf-mono" style="color:{T['success']};">Real {real:.1f}%</span>
     </div>
@@ -409,8 +456,33 @@ def render_verdict_card(result: dict) -> None:
 
     st.markdown(_card(inner, colour), unsafe_allow_html=True)
 
-    # High-risk alert strip (outside card)
-    if score > 90:
+    # ── UNCERTAIN warning banner ───────────────────────────────────────────────
+    if is_uncertain:
+        note = result.get("note", "")
+        st.markdown(f"""
+        <div style="
+            background:rgba(245,158,11,0.08);
+            border:1px solid {T['warning']}55;
+            border-left:4px solid {T['warning']};
+            border-radius:0 12px 12px 0;
+            padding:14px 18px;
+            margin-top:-8px;
+            margin-bottom:14px;
+        ">
+            <p style="margin:0 0 5px;color:{T['warning']};font-weight:700;font-size:0.90rem;">
+                ⚠️ Models disagree significantly
+            </p>
+            <p style="margin:0;color:{T['text2']};font-size:0.83rem;line-height:1.6;">
+                This may be a post-processed, composited, or edge-case image.
+                Do not rely on this result alone — corroborate with metadata and
+                manual inspection.
+            </p>
+            {f'<p style="margin:8px 0 0;color:{T["muted"]};font-size:0.77rem;font-style:italic;">{note}</p>' if note else ''}
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── High-risk banner (DEEPFAKE, HIGH confidence only) ────────────────────
+    elif verdict == "DEEPFAKE" and conf_level == "HIGH":
         st.markdown(f"""
         <div style="
             background:rgba(239,68,68,0.07);
@@ -419,19 +491,17 @@ def render_verdict_card(result: dict) -> None:
             padding:11px 16px;
             margin-top:-8px;
             margin-bottom:14px;
-            display:flex;
-            align-items:center;
-            gap:10px;
+            display:flex;align-items:center;gap:10px;
         ">
             <span style="font-size:1rem;">🚩</span>
             <span style="color:{T['danger']};font-weight:600;font-size:0.86rem;">High Risk</span>
             <span style="color:{T['text2']};font-size:0.83rem;">
-                Strong synthetic-generation signatures detected in pixel distribution.
+                Strong synthetic-generation signatures detected — both models in agreement.
             </span>
         </div>
         """, unsafe_allow_html=True)
 
-    # Probability breakdown (collapsible)
+    # ── Probability breakdown (collapsible) ───────────────────────────────────
     with st.expander("📊 Full Probability Breakdown"):
         for lbl, pct in result.get("all_scores", {}).items():
             bar_col = T["danger"] if any(k in lbl.lower() for k in ("artif","fake","ai")) else T["success"]
@@ -445,7 +515,7 @@ def render_verdict_card(result: dict) -> None:
             </div>
             """, unsafe_allow_html=True)
 
-    # Ensemble comparison (only when secondary model ran)
+    # ── Ensemble comparison (only when secondary model ran) ───────────────────
     if result.get("has_secondary"):
         render_ensemble_comparison(result)
 
@@ -454,52 +524,64 @@ def render_verdict_card(result: dict) -> None:
 #  Ensemble Model Comparison  [REDESIGNED — new premium layout]
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _model_card_html(model: dict) -> str:
-    """Build the inner HTML for a single model comparison card."""
+def _model_card_html(model: dict, is_uncertain: bool = False) -> str:
+    """
+    Build the inner HTML for a single model comparison card.
+    Shows per-model confidence score when available (new field from model.py v2).
+    """
     ai_pct   = model["ai_score"]
     real_pct = model["real_score"]
     is_fake  = ai_pct > 50.0
-    colour   = T["danger"] if is_fake else T["success"]
-    verdict  = "DEEPFAKE" if is_fake else "AUTHENTIC"
+    colour   = T["uncertain"] if is_uncertain else (T["danger"] if is_fake else T["success"])
+    verdict  = "UNCERTAIN" if is_uncertain else ("DEEPFAKE" if is_fake else "AUTHENTIC")
 
-    # Trim model label to "Primary" / "Secondary"
-    raw_name  = model["name"]
-    role      = raw_name.split(" (")[0]          # "Primary" or "Secondary"
-    sub_name  = raw_name.split("(")[-1].rstrip(")")  # e.g. "Organika/sdxl-detector"
+    raw_name = model["name"]
+    role     = raw_name.split(" (")[0]
+    sub_name = raw_name.split("(")[-1].rstrip(")")
+
+    # Per-model confidence (new field) — shown as a small pill
+    model_conf = model.get("confidence", None)
+    conf_pill  = ""
+    if model_conf is not None:
+        conf_col = T["success"] if model_conf >= 80 else T["warning"] if model_conf >= 60 else T["muted"]
+        conf_pill = (
+            f"<span style='font-family:DM Mono,monospace;font-size:0.68rem;"
+            f"color:{conf_col};background:{conf_col}18;border:1px solid {conf_col}33;"
+            f"border-radius:6px;padding:2px 7px;margin-left:8px;'>"
+            f"conf {model_conf:.0f}%</span>"
+        )
 
     return f"""
-    <!-- Card top bar coloured by verdict -->
     <div style="position:absolute;top:0;left:0;right:0;height:2px;
                 background:linear-gradient(90deg,{colour},{colour}44);"></div>
 
-    <!-- Role label + verdict badge -->
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;">
         <div>
             {_label(role + ' model')}
-            <p style="margin:0;color:{T['text2']};font-size:0.72rem;
+            <p style="margin:0;color:{T['text2']};font-size:0.71rem;
                       font-family:'DM Mono',monospace;letter-spacing:.03em;">
                 {sub_name}
             </p>
         </div>
-        {_badge(verdict, colour, "0.68rem")}
+        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;">
+            {_badge(verdict, colour, "0.67rem")}
+            {conf_pill}
+        </div>
     </div>
 
-    <!-- Big AI score -->
-    <div style="text-align:center;padding:6px 0 14px;">
-        <span style="font-family:'Rajdhani',sans-serif;font-size:2.4rem;
+    <div style="text-align:center;padding:4px 0 12px;">
+        <span style="font-family:'Rajdhani',sans-serif;font-size:2.3rem;
                      font-weight:700;color:{colour};letter-spacing:.04em;">
             {ai_pct:.1f}%
         </span>
-        <p style="margin:2px 0 0;color:{T['muted']};font-size:0.72rem;
+        <p style="margin:2px 0 0;color:{T['muted']};font-size:0.70rem;
                   letter-spacing:.1em;text-transform:uppercase;">AI Score</p>
     </div>
 
-    <!-- Mini progress bar -->
     {_progress_bar(ai_pct, colour, '6px', T['bg'])}
 
-    <!-- Real score footnote -->
-    <p style="margin:6px 0 0;text-align:right;color:{T['text2']};
-              font-family:'DM Mono',monospace;font-size:0.74rem;">
+    <p style="margin:5px 0 0;text-align:right;color:{T['text2']};
+              font-family:'DM Mono',monospace;font-size:0.73rem;">
         Real &nbsp;{real_pct:.1f}%
     </p>
     """
@@ -507,8 +589,15 @@ def _model_card_html(model: dict) -> str:
 
 def render_ensemble_comparison(result: dict) -> None:
     """
-    Side-by-side model prediction cards with agreement indicator badge.
-    [REDESIGNED: clean card grid, prominent agreement badge, refined typography]
+    Side-by-side model cards with agreement indicator and engine decision info.
+
+    v2 changes
+    ----------
+    • Agreement indicator now shows score gap (difference) explicitly
+    • UNCERTAIN state gets a distinct orange/amber treatment throughout
+    • Engine path note displayed below the comparison
+    • Weighted score bar shows actual weights used (not hardcoded 60/40)
+    • Per-model confidence pills sourced from new model.py confidence field
     """
     models = result.get("models", [])
     if len(models) < 2:
@@ -516,78 +605,100 @@ def render_ensemble_comparison(result: dict) -> None:
 
     _section_title("⚖️", "Ensemble Model Comparison")
 
-    # ── Agreement indicator ──────────────────────────────────────────────────
-    agreement       = result.get("agreement", True)
-    agree_colour    = T["success"] if agreement else T["warning"]
-    agree_icon      = "✅" if agreement else "⚠️"
-    agree_text      = "Models agree on verdict" if agreement else "Models disagree — review recommended"
-    agree_subtext   = ("Weighted ensemble applied for final confidence score."
-                       if agreement else
-                       "Score gap may indicate edge-case or post-processed image.")
+    agreement    = result.get("agreement", True)
+    diff         = result.get("difference", 0.0)
+    conf_level   = result.get("confidence_level", "MEDIUM")
+    final_verdict = result.get("final_verdict", "")
+    is_uncertain  = final_verdict == "UNCERTAIN"
+    note          = result.get("note", "")
+    weights_used  = result.get("weights_used", (0.6, 0.4))
+
+    # ── Agreement / Disagreement indicator ───────────────────────────────────
+    if is_uncertain:
+        agree_colour  = T["warning"]
+        agree_icon    = "⚠️"
+        agree_heading = f"Strong Disagreement — {diff:.1f} pt gap"
+        agree_body    = ("The models landed on opposite sides of the detection boundary. "
+                         "Verdict set to UNCERTAIN. Manual review is required.")
+    elif agreement:
+        agree_colour  = T["success"]
+        agree_icon    = "✅"
+        agree_heading = f"Models Agree  ·  Gap {diff:.1f} pts"
+        agree_body    = f"{conf_level.title()} confidence — weighted ensemble applied."
+    else:
+        agree_colour  = T["warning"]
+        agree_icon    = "⚠️"
+        agree_heading = f"Weak Agreement  ·  Gap {diff:.1f} pts"
+        agree_body    = ("Models lean the same direction but differ in magnitude. "
+                         "Confidence reduced accordingly.")
 
     st.markdown(f"""
     <div style="
-        background:linear-gradient(135deg,{agree_colour}12,{agree_colour}06);
+        background:linear-gradient(135deg,{agree_colour}10,{agree_colour}05);
         border:1px solid {agree_colour}44;
-        border-radius:12px;
+        border-left:4px solid {agree_colour};
+        border-radius:0 12px 12px 0;
         padding:14px 18px;
         margin-bottom:18px;
-        display:flex;
-        align-items:flex-start;
-        gap:14px;
+        display:flex;align-items:flex-start;gap:14px;
     ">
-        <span style="font-size:1.3rem;line-height:1;">{agree_icon}</span>
+        <span style="font-size:1.25rem;line-height:1.2;">{agree_icon}</span>
         <div>
-            <p style="margin:0 0 3px;font-weight:700;color:{agree_colour};font-size:0.90rem;">
-                {agree_text}
+            <p style="margin:0 0 4px;font-weight:700;color:{agree_colour};font-size:0.90rem;">
+                {agree_heading}
             </p>
-            <p style="margin:0;color:{T['text2']};font-size:0.80rem;">{agree_subtext}</p>
+            <p style="margin:0;color:{T['text2']};font-size:0.81rem;line-height:1.55;">
+                {agree_body}
+            </p>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Side-by-side model cards ─────────────────────────────────────────────
+    # ── Side-by-side model cards ──────────────────────────────────────────────
     col_a, col_b = st.columns(2, gap="medium")
 
-    with col_a:
-        m = models[0]
-        ai_pct  = m["ai_score"]
-        is_fake = ai_pct > 50.0
-        colour  = T["danger"] if is_fake else T["success"]
-        st.markdown(f"""
-        <div style="
-            background:{T['surface']};border:1px solid {colour}44;border-radius:14px;
-            padding:20px 20px 16px;box-shadow:0 4px 20px rgba(0,0,0,0.4);
-            position:relative;overflow:hidden;
-        ">{_model_card_html(m)}</div>
-        """, unsafe_allow_html=True)
+    for col, model_idx in ((col_a, 0), (col_b, 1)):
+        m      = models[model_idx]
+        ai_pct = m["ai_score"]
+        # For uncertain, highlight both cards in amber
+        if is_uncertain:
+            border_col = T["warning"]
+        else:
+            border_col = T["danger"] if ai_pct > 50 else T["success"]
+        with col:
+            st.markdown(f"""
+            <div style="
+                background:{T['surface']};
+                border:1px solid {border_col}44;
+                border-radius:14px;
+                padding:20px 20px 16px;
+                box-shadow:0 4px 20px rgba(0,0,0,0.4);
+                position:relative;overflow:hidden;
+            ">{_model_card_html(m, is_uncertain=is_uncertain)}</div>
+            """, unsafe_allow_html=True)
 
-    with col_b:
-        m = models[1]
-        ai_pct  = m["ai_score"]
-        is_fake = ai_pct > 50.0
-        colour  = T["danger"] if is_fake else T["success"]
-        st.markdown(f"""
-        <div style="
-            background:{T['surface']};border:1px solid {colour}44;border-radius:14px;
-            padding:20px 20px 16px;box-shadow:0 4px 20px rgba(0,0,0,0.4);
-            position:relative;overflow:hidden;
-        ">{_model_card_html(m)}</div>
-        """, unsafe_allow_html=True)
+    # ── Ensemble score bar + weights used ────────────────────────────────────
+    final_ai  = result.get("final_ai_score", result.get("ai_score", 0))
+    bar_colour = T["warning"] if is_uncertain else T["accent_light"]
+    pw, sw     = weights_used
+    weight_label = (
+        f"Ensemble Score  ·  {pw*100:.0f}% primary / {sw*100:.0f}% secondary"
+        if not is_uncertain else
+        "Uncertainty-adjusted Score (not a simple average)"
+    )
 
-    # ── Weighted final score bar ─────────────────────────────────────────────
-    final_ai = result.get("final_ai_score", result.get("ai_score", 0))
     st.markdown(f"""
     <div style="
-        background:{T['surface2']};border:1px solid {T['border2']};border-radius:12px;
-        padding:16px 20px;margin-top:4px;
+        background:{T['surface2']};border:1px solid {T['border2']};
+        border-radius:12px;padding:16px 20px;margin-top:6px;
     ">
-        {_label('Weighted Ensemble Score (60% primary / 40% secondary)')}
-        {_progress_bar(final_ai, T['accent_light'], '8px', T['bg'])}
-        <div style="display:flex;justify-content:space-between;margin-top:2px;">
-            <span class="cf-mono" style="color:{T['accent_light']};">AI {final_ai:.1f}%</span>
+        {_label(weight_label)}
+        {_progress_bar(final_ai, bar_colour, '8px', T['bg'])}
+        <div style="display:flex;justify-content:space-between;margin-top:3px;">
+            <span class="cf-mono" style="color:{bar_colour};">AI {final_ai:.1f}%</span>
             <span class="cf-mono" style="color:{T['success']};">Real {100-final_ai:.1f}%</span>
         </div>
+        {f'<p style="margin:10px 0 0;color:{T[chr(34)]+"muted"+chr(34)};font-size:0.76rem;font-style:italic;">{note}</p>' if note else ''}
     </div>
     """, unsafe_allow_html=True)
 
