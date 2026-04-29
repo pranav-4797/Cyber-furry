@@ -2,9 +2,15 @@
 model.py — CyberFury AI Forensic Lab
 Handles model loading, image validation, prediction, and explainability.
 
-ENSEMBLE v2: Replaced naive weighted-average with a four-path decision engine
-that detects strong disagreement, applies dynamic trust weighting, and returns
-an UNCERTAIN verdict when models conflict irreconcilably.
+ENSEMBLE v3: Five-path decision engine.
+  Path A — Strong AI agreement      → DEEPFAKE   HIGH
+  Path B — Strong Real agreement    → AUTHENTIC  HIGH
+  Path C — Dominant model override  → trust ≥90 % confident model, MEDIUM
+  Path D — Moderate agreement       → weighted average, MEDIUM
+  Path E — True strong disagreement → UNCERTAIN  LOW  (neither model is dominant)
+
+Path C prevents extreme splits like 100 % vs 9.7 % from incorrectly producing
+UNCERTAIN — when one model is clearly dominant, its verdict is applied.
 """
 
 import torch
@@ -25,8 +31,9 @@ SECONDARY_MODEL_WEIGHT = 0.4
 # Decision thresholds
 _STRONG_AGREE_AI_THRESHOLD    = 70.0   # both models ≥ this  → strong DEEPFAKE
 _STRONG_AGREE_REAL_THRESHOLD  = 30.0   # both models ≤ this  → strong AUTHENTIC
-_DISAGREEMENT_THRESHOLD       = 40.0   # score gap ≥ this    → UNCERTAIN
+_DISAGREEMENT_THRESHOLD       = 40.0   # score gap ≥ this    → UNCERTAIN (only if neither dominates)
 _HIGH_CONFIDENCE_THRESHOLD    = 90.0   # single-model conf   → boost that model's weight
+_DOMINANT_CONFIDENCE          = 90.0   # one model ≥ this    → trust it even under disagreement
 
 # ─── Constraints ──────────────────────────────────────────────────────────────
 MAX_PIXELS  = 4096
@@ -207,12 +214,18 @@ def _build_ensemble_verdict(
     s_result: dict,
 ) -> dict:
     """
-    Four-path decision engine.  Replaces the old single weighted-average.
+    Five-path decision engine.
 
-    Path A — Strong AI agreement    → DEEPFAKE   HIGH
-    Path B — Strong Real agreement  → AUTHENTIC  HIGH
-    Path C — Moderate agreement     → weighted average, MEDIUM
-    Path D — Strong disagreement    → UNCERTAIN  LOW  (score NOT averaged blindly)
+    Path A — Strong AI agreement      → DEEPFAKE   HIGH
+    Path B — Strong Real agreement    → AUTHENTIC  HIGH
+    Path C — Dominant model override  → trust the ≥90 % confident model, MEDIUM
+    Path D — Moderate agreement       → weighted average, MEDIUM
+    Path E — True strong disagreement → UNCERTAIN  LOW  (neither model is dominant)
+
+    Path C is the key addition: when one model scores ≥ 90 % confident and the
+    other does not reach that bar, the dominant model wins regardless of direction
+    disagreement.  This prevents a 100 % vs 10 % split from producing UNCERTAIN
+    when the answer is obvious.
 
     Returns a structured verdict dict consumed by _run_ensemble_inference().
     """
@@ -224,8 +237,7 @@ def _build_ensemble_verdict(
 
     # ── Path A: Both strongly say AI ──────────────────────────────────────────
     if case == "STRONG_AI":
-        final_ai  = (p_ai * pw) + (s_ai * sw)          # weighted average (both high)
-        conf_raw  = (p_result["confidence"] * pw) + (s_result["confidence"] * sw)
+        final_ai = (p_ai * pw) + (s_ai * sw)
         return _verdict_dict(
             verdict        = "DEEPFAKE",
             final_ai       = final_ai,
@@ -249,13 +261,53 @@ def _build_ensemble_verdict(
             weights_used   = (pw, sw),
         )
 
-    # ── Path C: Moderate agreement (same side, gap < threshold) ──────────────
+    # ── Path C: Dominant model override (one model ≥ 90 % confident) ─────────
+    # When one model is extremely confident and the other is not, the confident
+    # model's verdict stands.  This handles cases like 100 % vs 9.7 % where
+    # UNCERTAIN would be misleading — the primary model is clearly more decisive.
+    p_conf = max(p_ai, 100 - p_ai)
+    s_conf = max(s_ai, 100 - s_ai)
+
+    if p_conf >= _DOMINANT_CONFIDENCE or s_conf >= _DOMINANT_CONFIDENCE:
+        if p_conf >= s_conf:
+            # Primary dominates
+            dominant_ai      = p_ai
+            dominant_verdict = "DEEPFAKE" if p_ai >= 50.0 else "AUTHENTIC"
+            dominant_name    = "Primary"
+            # Weight heavily toward primary; secondary adds a small correction
+            eff_pw, eff_sw   = 0.85, 0.15
+            note = (
+                f"Primary model is highly confident ({p_conf:.0f}% certainty). "
+                f"Secondary model ({s_ai:.1f}% AI) disagrees but carries low weight. "
+                f"Primary verdict applied with {eff_pw*100:.0f}/{eff_sw*100:.0f} weighting."
+            )
+        else:
+            # Secondary dominates
+            dominant_ai      = s_ai
+            dominant_verdict = "DEEPFAKE" if s_ai >= 50.0 else "AUTHENTIC"
+            dominant_name    = "Secondary"
+            eff_pw, eff_sw   = 0.15, 0.85
+            note = (
+                f"Secondary model is highly confident ({s_conf:.0f}% certainty). "
+                f"Primary model ({p_ai:.1f}% AI) disagrees but carries low weight. "
+                f"Secondary verdict applied with {eff_pw*100:.0f}/{eff_sw*100:.0f} weighting."
+            )
+
+        final_ai = (p_ai * eff_pw) + (s_ai * eff_sw)
+        return _verdict_dict(
+            verdict        = dominant_verdict,
+            final_ai       = final_ai,
+            confidence_lvl = "MEDIUM",   # not HIGH — there is genuine disagreement
+            agreement      = False,
+            diff           = diff,
+            note           = note,
+            weights_used   = (eff_pw, eff_sw),
+        )
+
+    # ── Path D: Moderate agreement (same side, gap < threshold) ──────────────
     if case in ("MODERATE", "WEAK_AGREEMENT"):
         final_ai = (p_ai * pw) + (s_ai * sw)
         verdict  = "DEEPFAKE" if final_ai >= 50.0 else "AUTHENTIC"
-        # Confidence degrades as the gap grows
-        conf_penalty = min(diff / _DISAGREEMENT_THRESHOLD, 1.0) * 15   # up to -15 pts
-        conf_lvl = "MEDIUM"
         note = (
             "Models lean the same direction but differ in magnitude. "
             f"Score gap: {diff:.1f} pts — weighted average applied."
@@ -263,19 +315,17 @@ def _build_ensemble_verdict(
         return _verdict_dict(
             verdict        = verdict,
             final_ai       = final_ai,
-            confidence_lvl = conf_lvl,
+            confidence_lvl = "MEDIUM",
             agreement      = True,
             diff           = diff,
             note           = note,
             weights_used   = (pw, sw),
         )
 
-    # ── Path D: Strong disagreement — UNCERTAIN ───────────────────────────────
-    # Do NOT blindly average.  Instead anchor to the more-confident model
-    # but cap the final score at 65 % on either side to reflect uncertainty.
-    p_conf = max(p_ai, 100 - p_ai)
-    s_conf = max(s_ai, 100 - s_ai)
-
+    # ── Path E: True strong disagreement — UNCERTAIN ──────────────────────────
+    # Both models are moderately confident but point in opposite directions.
+    # Neither is dominant (both below _DOMINANT_CONFIDENCE).
+    # Anchor to the more confident model but pull toward 50 to reflect uncertainty.
     if p_conf >= s_conf:
         anchor_ai   = p_ai
         anchor_note = "Primary model (higher confidence) used as anchor."
@@ -283,14 +333,13 @@ def _build_ensemble_verdict(
         anchor_ai   = s_ai
         anchor_note = "Secondary model (higher confidence) used as anchor."
 
-    # Shrink the score toward 50 to represent genuine uncertainty
     uncertainty_pull = 0.40   # pull 40 % of the way back to 50
     final_ai = anchor_ai + (50.0 - anchor_ai) * uncertainty_pull
     final_ai = round(min(max(final_ai, 0.0), 100.0), 2)
 
     note = (
-        f"Models strongly disagree (gap: {diff:.1f} pts). "
-        f"Result may be unreliable — post-processing or edge-case image suspected. "
+        f"Models disagree without a dominant signal (gap: {diff:.1f} pts). "
+        f"Result may be unreliable — edge-case or post-processed image suspected. "
         f"{anchor_note}"
     )
 
