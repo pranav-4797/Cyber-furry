@@ -5,6 +5,7 @@ explainability panel, metadata viewer, and forensic tools bar.
 """
 
 import streamlit as st
+import textwrap
 import urllib.parse
 
 # ─── Colour Palette ───────────────────────────────────────────────────────────
@@ -239,7 +240,7 @@ def render_verdict_card(result: dict) -> None:
     verdict = result["verdict"]
     tier    = result["conf_label"]
 
-    st.markdown(f"""
+    html = f"""
     <div class="cf-card" style="border-color:{colour}40; position:relative; overflow:hidden;">
         <!-- Glow strip -->
         <div style="position:absolute; top:0; left:0; right:0; height:3px;
@@ -280,7 +281,8 @@ def render_verdict_card(result: dict) -> None:
             <span class="cf-mono">Real: {result['real_score']:.2f}%</span>
         </div>
     </div>
-    """, unsafe_allow_html=True)
+    """
+    st.markdown(textwrap.dedent(html), unsafe_allow_html=True)
 
     # High-risk banner
     if score > 90:
