@@ -407,15 +407,15 @@ def render_verdict_card(result: dict) -> None:
     diff = result.get("difference", 0.0)
     diff_row = ""
     if is_uncertain and diff > 0:
-        diff_row = f"""
-        <div style="display:inline-flex;align-items:center;gap:8px;
-                    background:{T['warning']}18;border:1px solid {T['warning']}33;
-                    border-radius:8px;padding:5px 12px;margin-top:10px;">
-            <span style="color:{T['warning']};font-size:0.78rem;font-weight:700;">
-                Score Gap
-            </span>
-            <span class="cf-mono" style="color:{T['warning']};">{diff:.1f} pts</span>
-        </div>"""
+        _w = T["warning"]   # pre-resolve to avoid double-interpolation inside outer f-string
+        diff_row = (
+            f'<div style="display:inline-flex;align-items:center;gap:8px;'
+            f'background:{_w}18;border:1px solid {_w}33;'
+            f'border-radius:8px;padding:5px 12px;margin-top:10px;">'
+            f'<span style="color:{_w};font-size:0.78rem;font-weight:700;">Score Gap</span>'
+            f'<span class="cf-mono" style="color:{_w};">{diff:.1f} pts</span>'
+            f'</div>'
+        )
 
     # ── Progress bar track colour ─────────────────────────────────────────────
     bar_track = T["uncertain_bg"] if is_uncertain else T["surface2"]
@@ -698,7 +698,7 @@ def render_ensemble_comparison(result: dict) -> None:
             <span class="cf-mono" style="color:{bar_colour};">AI {final_ai:.1f}%</span>
             <span class="cf-mono" style="color:{T['success']};">Real {100-final_ai:.1f}%</span>
         </div>
-        {f'<p style="margin:10px 0 0;color:{T[chr(34)]+"muted"+chr(34)};font-size:0.76rem;font-style:italic;">{note}</p>' if note else ''}
+        {f'<p style="margin:10px 0 0;color:{T["muted"]};font-size:0.76rem;font-style:italic;">{note}</p>' if note else ''}
     </div>
     """, unsafe_allow_html=True)
 
