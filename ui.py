@@ -628,9 +628,9 @@ def render_ensemble_comparison(result: dict) -> None:
     else:
         agree_colour  = T["warning"]
         agree_icon    = "⚠️"
-        agree_heading = f"Weak Agreement  ·  Gap {diff:.1f} pts"
-        agree_body    = ("Models lean the same direction but differ in magnitude. "
-                         "Confidence reduced accordingly.")
+        agree_heading = f"Dominant Model Override  ·  Gap {diff:.1f} pts"
+        agree_body    = ("Models disagree, but the more confident model's verdict "
+                         "has been applied with heavier weighting.")
 
     st.markdown(f"""
     <div style="

@@ -5,7 +5,7 @@ Handles model loading, image validation, prediction, and explainability.
 ENSEMBLE v3: Five-path decision engine.
   Path A — Strong AI agreement      → DEEPFAKE   HIGH
   Path B — Strong Real agreement    → AUTHENTIC  HIGH
-  Path C — Dominant model override  → trust ≥90 % confident model, MEDIUM
+  Path C — Dominant model override  → trust ≥90 % confident model when models DISAGREE, MEDIUM
   Path D — Moderate agreement       → weighted average, MEDIUM
   Path E — True strong disagreement → UNCERTAIN  LOW  (neither model is dominant)
 
@@ -262,13 +262,16 @@ def _build_ensemble_verdict(
         )
 
     # ── Path C: Dominant model override (one model ≥ 90 % confident) ─────────
-    # When one model is extremely confident and the other is not, the confident
-    # model's verdict stands.  This handles cases like 100 % vs 9.7 % where
-    # UNCERTAIN would be misleading — the primary model is clearly more decisive.
+    # Only applies when models DISAGREE (different sides of the 50 % boundary).
+    # When both models agree on the verdict direction, Path D handles them with
+    # proper weighted averaging — no need to override.
+    # This handles cases like 100 % vs 9.7 % where UNCERTAIN would be
+    # misleading — the primary model is clearly more decisive.
     p_conf = max(p_ai, 100 - p_ai)
     s_conf = max(s_ai, 100 - s_ai)
+    models_disagree = (p_ai >= 50.0) != (s_ai >= 50.0)
 
-    if p_conf >= _DOMINANT_CONFIDENCE or s_conf >= _DOMINANT_CONFIDENCE:
+    if models_disagree and (p_conf >= _DOMINANT_CONFIDENCE or s_conf >= _DOMINANT_CONFIDENCE):
         if p_conf >= s_conf:
             # Primary dominates
             dominant_ai      = p_ai
